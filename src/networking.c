@@ -194,6 +194,20 @@ void clientInstallWriteHandler(client *c) {
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for slaves, if the slave can actually receive
      * writes at this stage. */
+    /*
+        能否推迟客户端写操作，最终是由clientInstallWriteHandler函数来决定的,
+        这个函数会判断两个条件。
+
+        条件一:客户端没有设置过CLIENT_PENDING_WRITE标识，即没有被推迟过执行写操作。
+        条件二:客户端所在实例没有进行主从复制，或者客户端所在实例是主从复制中的从节
+            点但全量复制的RDB文件已经传输完成，客户端可以接收请求。
+
+        一旦这两个条件都满足了，clientInstallWriteHandler 函数就会把客户端标识设置为
+        CLIENT_PENDING_WRITE,表示推迟该客户端的写操作。同时clientInstallWriteHandler函数
+        会把这个客户端添加到全局变量server的待写回客户端列表中，也就是clients_pending_write列表中。
+
+    
+    */
     if (!(c->flags & CLIENT_PENDING_WRITE) &&
         (c->replstate == REPL_STATE_NONE ||
          (c->replstate == SLAVE_STATE_ONLINE && !c->repl_put_online_on_ack)))
@@ -255,6 +269,10 @@ int prepareClientToWrite(client *c) {
      * If CLIENT_PENDING_READ is set, we're in an IO thread and should
      * not install a write handler. Instead, it will be done by
      * handleClientsWithPendingReadsUsingThreads() upon return.
+     */
+    /* 
+        如果当前客户端没有待写回数据，调用clientInstallWriteHandler，再进一步
+        判断能否推迟该客户端写操作
      */
     if (!clientHasPendingReplies(c) && !(c->flags & CLIENT_PENDING_READ))
             clientInstallWriteHandler(c);
@@ -332,6 +350,7 @@ void _addReplyProtoToList(client *c, const char *s, size_t len) {
 
 /* Add the object 'obj' string representation to the client output buffer. */
 void addReply(client *c, robj *obj) {
+    /* 判断是否推迟客户端写操作 */
     if (prepareClientToWrite(c) != C_OK) return;
 
     if (sdsEncodedObject(obj)) {
@@ -2022,6 +2041,7 @@ void readQueryFromClient(connection *conn) {
 
     /* Check if we want to read from the client later when exiting from
      * the event loop. This is the case if threaded I/O is enabled. */
+    /* 判断是否推迟从客户端读取数据 */
     if (postponeClientRead(c)) return;
 
     /* Update total number of reads on server */
@@ -3047,16 +3067,32 @@ int tio_debug = 0;
 #define IO_THREADS_OP_READ 0
 #define IO_THREADS_OP_WRITE 1
 
+/* 保存每个IO线程的描述符 */
 pthread_t io_threads[IO_THREADS_MAX_NUM];
+/* 保存线程互斥锁 */
 pthread_mutex_t io_threads_mutex[IO_THREADS_MAX_NUM];
+/* 保存等待每个IO线程处理的客户端个数 */
 _Atomic unsigned long io_threads_pending[IO_THREADS_MAX_NUM];
 int io_threads_op;      /* IO_THREADS_OP_WRITE or IO_THREADS_OP_READ. */
 
 /* This is the list of clients each thread will serve when threaded I/O is
  * used. We spawn io_threads_num-1 threads, since one is the main thread
  * itself. */
+/* 保存了每个IO线程要处理的客户端，将数组每个元素初始化为一个list类型的列表 */
 list *io_threads_list[IO_THREADS_MAX_NUM];
 
+/*
+    io_threads_list数组中会针对每个IO线程，使用一个列表记录该线程要处理的客户端。
+    所以，IOThreadMain 函数就会从每个IO线程对应的列表中,进一步取出要处理的客户端，
+    然后判断线程要执行的操作标记。这个操作标记是用变量io_threads_op表示的，它有两种取值。
+
+    io_threads_op的值为宏定义IO_THREADS_OP_WRITE:这表明该IO线程要做的是写操作，
+    线程会调用writeToClient函数将数据写回客户端。
+
+    io_threads_op的值为宏定义IO_THREADS_OP_READ:这表明该IO线程要做的是读操作，
+    线程会调用readQueryFromClient函数从客户端读取数据。
+
+*/
 void *IOThreadMain(void *myid) {
     /* The ID is the thread number (from 0 to server.iothreads_num-1), and is
      * used by the thread to just manipulate a single sub-array of clients. */
@@ -3109,19 +3145,37 @@ void *IOThreadMain(void *myid) {
 
 /* Initialize the data structures needed for threaded I/O. */
 void initThreadedIO(void) {
+    /*
+        首先, initThreadedIO函数会设置IO线程的激活标志。这个激活标志保存在redisServer
+        结构体类型的全局变量server当中,对应redisServer结构体的成员变量io_threads_active。
+        initThreadedIO 函数会把io_threads_active 初始化为0, 表示IO线程还没有被激活。
+    */
     server.io_threads_active = 0; /* We start with threads not active. */
 
+    /*
+        紧接着, initThreadedIO函数会对设置的IO线程数量进行判断。这个数量就是保存在全局
+        变量server的成员变量io_threads_num中的。那么在这里，IO线程的数量判断会有三种结果。
+
+        第一种，如果IO线程数量为1,就表示只有1个主IO线程，initThreadedIO函数就直接
+        返回了。此时，Redis server的IO线程和Redis 6.0之前的版本是相同的。
+    */
     /* Don't spawn any thread if the user selected a single thread:
      * we'll handle I/O directly from the main thread. */
     if (server.io_threads_num == 1) return;
-
+    /*
+        第二种,如果IO线程数量大于宏定义IO_THREADS_MAX_NUM(默认值为128) ,那么
+        initThreadedIO函数会报错,并退出整个程序。
+    */
     if (server.io_threads_num > IO_THREADS_MAX_NUM) {
         serverLog(LL_WARNING,"Fatal: too many I/O threads configured. "
                              "The maximum number is %d.", IO_THREADS_MAX_NUM);
         exit(1);
     }
-
-    /* Spawn and initialize the I/O threads. */
+    /*
+        第三种，如果IO线程数量大于1,并且小于宏定义IO_THREADS_MAX_NUM,那么,
+        initThreadedIO函数会执行一个循环流程，该流程的循环次数就是设置的IO线程数量。
+    */
+    /* 根据IO线程数量，调用pthread_create函数创建相应数量的线程 */
     for (int i = 0; i < server.io_threads_num; i++) {
         /* Things we do for all the threads including the main thread. */
         io_threads_list[i] = listCreate();
@@ -3132,6 +3186,10 @@ void initThreadedIO(void) {
         pthread_mutex_init(&io_threads_mutex[i],NULL);
         io_threads_pending[i] = 0;
         pthread_mutex_lock(&io_threads_mutex[i]); /* Thread will be stopped. */
+        /*
+            创建的线程要运行的函数是IOThreadMain,参数是当前创建线程的编号。不过要注意的是，
+            这个编号是从1开始的，编号为0的线程其实是运行Redis server主流程的主IO线程。
+        */
         if (pthread_create(&tid,NULL,IOThreadMain,(void*)(long)i) != 0) {
             serverLog(LL_WARNING,"Fatal: Can't initialize IO thread.");
             exit(1);
@@ -3202,7 +3260,7 @@ int stopThreadedIOIfNeeded(void) {
         return 0;
     }
 }
-
+/* 该函数主要负责将clients_pending_write列表中的客户端分配给IO线程进行处理 */
 int handleClientsWithPendingWritesUsingThreads(void) {
     int processed = listLength(server.clients_pending_write);
     if (processed == 0) return 0; /* Return ASAP if there are no clients. */
@@ -3291,6 +3349,35 @@ int handleClientsWithPendingWritesUsingThreads(void) {
  * As a side effect of calling this function the client is put in the
  * pending read clients and flagged as such. */
 int postponeClientRead(client *c) {
+    /*
+        条件一:全局变量server的io_threads_active 值为1
+            这表示多IO线程已经激活。这个变量值在initThreadedIO函数中是会被初始化
+            为0的，也就是说，多I0线程初始化后，默认还没有激活。
+
+        条件二:全局变量server的io_threads_do_reads 值为1.
+            这表示多IO线程可以用于处理延后执行的客户端读操作。这个变量值是在Redis
+            配置文件redis.conf中,通过配置项io-threads-do-reads设置的，默认值为no,
+            也就是说，多IO线程机制默认并不会用于客户端读操作。所以，如果你想用
+            多IO线程处理客户端读操作,就需要把io-threads-do-reads配置项设为yes。
+
+        条件三: ProcessingEventsWhileBlocked 变量值为0
+            这表示processEventsWhileBlocked函数没有在执行。ProcessingEventsWhileBlocked
+            是一个全局变量，它会在processEventsWhileBlocked函数执行时被设置为1,在
+            processEventsWhileBlocked函数执行完成时被设置为0。
+            
+            当Redis在读取RDB文件或是AOF文件时，这个函数会被调用,用来处理事件驱动框架捕获到的事件。
+            这样就避免了因读取RDB或AOF文件造成Redis阻塞，而无法及时处理事件的情况。所以,
+            当processEventsWhileBlocked函数执行处理客户端可读事件时，这些客户端读操作是不会被推迟执行的。
+
+        条件四:客户端现有标识不能有CLIENT_MASTER、CLIENT_SLAVE、CLIENT_PENDING_READ
+            CLIENT_MASTER、CLIENT_SLAVE标识分别表示客户端是用于主从复制的客户端，也就是说，这些客户端
+            不会推迟读操作。CLIENT_PENDING_READ本身就表示一个客户端已经被设置为推迟读操作了，所以，
+            对于已带有CLIENT_PENDING_READ标识的客户端,postponeClientRead函数就不会再推迟它的读操作了。
+
+        总之，只有前面这四个条件都满足了，postponeClientRead 函数才会推迟当前客户端的读操作。具体来说，
+        postponeClientRead 函数会给该客户端设置CLIENT_PENDING_READ标识，并调用listAddNodeHead函数,
+        把这个客户端添加到全局变量server的clients_pending_read 列表中。
+    */
     if (server.io_threads_active &&
         server.io_threads_do_reads &&
         !clientsArePaused() &&
@@ -3311,8 +3398,32 @@ int postponeClientRead(client *c) {
  * the queue using the I/O threads, and process them in order to accumulate
  * the reads in the buffers, and also parse the first command available
  * rendering it in the client structures. */
+/* 该函数主要负责将clients_pending_read列表中的客户端分配给IO线程进行处理 */
 int handleClientsWithPendingReadsUsingThreads(void) {
+    /*
+        第一步，该函数会先根据全局变量server的io_threads_active 成员变量,判定IO线程是
+        否激活，并粗根据server的io_threads_do_reads 成员变量，判定用户是否设置了Redis
+        可以用IO线程处理待读客户端。只有在IO线程激活，并且IO线程可以用于处理待读客户端时，
+        handleClientsWithPendingReadsUsingThreads函数才会继续执行，否则该函数就
+        直接结束返回了。
+    */
     if (!server.io_threads_active || !server.io_threads_do_reads) return 0;
+
+    /*
+        第二步，handleClientsWithPendingReadsUsingThreads函数会获取clients_pending_read
+        列表的长度,这代表了要处理的待读客户端个数。然后，该函数会从clients_pending_read
+        列表中逐一取出待处理的客户端，并用客户端在列表中的序号,对IO线程数量进行取模运算。
+
+        这样一来，就可以根据取模得到的余数,把该客户端分配给对应的IO线程进行处理。紧接着
+        handleClientsWithPendingReadsUsingThreads 函数会调用listAddNodeTail函数,把
+        分配好的客户端添加到io_threads_list列表的相应元素中。
+        io_threads_list数组的每个元素是一个列表， 对应保存了每个IO线程要处理的客户端。
+
+        这样，当handleClientsWithPendingReadsUsingThreads函数完成客户端的IO线程分配
+        之后，它会将IO线程的操作标识设置为读操作,也就是IO_THREADS_OP_READ。 然后,
+        它会遍历io_threads_list数组中的每个元素列表长度，等待每个线程处理的客户端数量,
+        赋值给io_threads_pending数组。
+    */
     int processed = listLength(server.clients_pending_read);
     if (processed == 0) return 0;
 
@@ -3338,6 +3449,16 @@ int handleClientsWithPendingReadsUsingThreads(void) {
         io_threads_pending[j] = count;
     }
 
+    /*
+        第三步，handleClientsWithPendingReadsUsingThreads函数会将io_threads_list数组
+        0号列表(也就是io_threads_list[0]元素)中的待读客户端逐一取出来，并调用
+        readQueryFromClient函数进行处理。
+
+        其实，handleClientsWithPendingReadsUsingThreads函数本身就是由IO主线程执行的,
+        而io_threads_list数组对应的0号线程正是IO主线程,所以,这里就是让主IO线程
+        来处理它的待读客户端。
+    */
+
     /* Also use the main thread to process a slice of clients. */
     listRewind(io_threads_list[0],&li);
     while((ln = listNext(&li))) {
@@ -3354,7 +3475,15 @@ int handleClientsWithPendingReadsUsingThreads(void) {
         if (pending == 0) break;
     }
     if (tio_debug) printf("I/O READ All threads finshed\n");
+    /*
+        第四步，handleClientsWithPendingReadsUsingThreads函数会再次遍历一遍
+        clients_pending_read列表，依次取出其中的客户端。紧接着，它会判断客户端的标识中是
+        否有CLIENT_PENDING_COMMAND。如果有CLIENT_PENDING_COMMAND标识,表明该客户端中的命令
+        已经被某一个IO线程解析过,已经可以被执行了。
 
+        此时，handleClientsWithPendingReadsUsingThreads 函数会调用processCommandAndResetClient函数执行命令。
+        最后,它会直接调用processInputBuffer函数解析客户端中所有命令并执行。
+    */
     /* Run the list of clients again to process the new buffers. */
     while(listLength(server.clients_pending_read)) {
         ln = listFirst(server.clients_pending_read);
